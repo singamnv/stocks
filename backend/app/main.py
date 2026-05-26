@@ -42,9 +42,4 @@ app.include_router(ecosystems.router)
 
 @app.get("/health")
 def health() -> dict:
-    from .services.yf_service import rate_limit_status
-    return {
-        "status": "ok",
-        "finnhub_configured": bool(settings.FINNHUB_API_KEY),
-        "yfinance": rate_limit_status(),
-    }
+    return {"status": "ok", "finnhub_configured": bool(settings.FINNHUB_API_KEY)}

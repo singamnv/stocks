@@ -1,9 +1,12 @@
-"""Macro data for the Morning Brief: futures, FX/commodities, rates, VIX, global indices, sectors."""
+"""Macro data for the Morning Brief: futures, FX/commodities, rates, VIX, global indices, sectors.
+
+Uses yf_batch (direct Yahoo /v7/quote) so all ~30 macro symbols come back in
+ONE HTTP call instead of one-per-ticker.
+"""
 from typing import Optional
 
-import yfinance as yf
-
 from ..cache import cached
+from . import yf_batch
 from .yf_service import _safe_float
 
 FUTURES = [
@@ -57,25 +60,15 @@ ALL_SYMBOLS: list[str] = list({
 
 @cached("macro", ttl=300)
 def _fetch_all() -> dict[str, dict]:
-    """Batch-fetch every macro symbol via yf.Tickers; returns symbol -> {price, prev}."""
-    tickers = yf.Tickers(" ".join(ALL_SYMBOLS))
+    """One batched /v7/quote call for all ~30 macro symbols; returns symbol -> {price, prev}."""
+    quotes = yf_batch.fetch_quotes(ALL_SYMBOLS)
     out: dict[str, dict] = {}
     for sym in ALL_SYMBOLS:
-        try:
-            t = tickers.tickers.get(sym)
-            if t is None:
-                out[sym] = {"price": None, "prev": None}
-                continue
-            try:
-                fast = dict(t.fast_info) if t.fast_info else {}
-            except Exception:
-                fast = {}
-            out[sym] = {
-                "price": _safe_float(fast.get("lastPrice") or fast.get("last_price")),
-                "prev": _safe_float(fast.get("previousClose") or fast.get("previous_close")),
-            }
-        except Exception:
-            out[sym] = {"price": None, "prev": None}
+        q = quotes.get(sym) or {}
+        out[sym] = {
+            "price": _safe_float(q.get("price")),
+            "prev": _safe_float(q.get("prev_close")),
+        }
     return out
 
 
