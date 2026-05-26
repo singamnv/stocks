@@ -1,0 +1,21 @@
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.env
+
+# generated briefs
+backend/data/
+
+# node
+node_modules/
+dist/
+.vite/
+
+# editor / os
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

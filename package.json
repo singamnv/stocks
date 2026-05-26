@@ -1,0 +1,15 @@
+{
+  "name": "nvidia-ecosystem-tracker",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Live dashboard for NVIDIA's suppliers, partners, and direct investments.",
+  "scripts": {
+    "install:all": "npm install && npm --prefix frontend install && pip install -r backend/requirements.txt",
+    "dev": "concurrently -n be,fe -c blue,green \"npm:dev:backend\" \"npm:dev:frontend\"",
+    "dev:backend": "python -m uvicorn app.main:app --reload --port 8000 --app-dir backend",
+    "dev:frontend": "npm --prefix frontend run dev"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
