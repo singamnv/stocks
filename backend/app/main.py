@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
 from .routers import ai_brief, brief, earnings, ecosystems, kpis, news, tickers
-from .services.warmup import warm_all_caches
+from .services.warmup import warm_default_ecosystem
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Kick off cache warmup in the background — server is ready to serve immediately.
-    task = asyncio.create_task(warm_all_caches())
+    task = asyncio.create_task(warm_default_ecosystem())
     try:
         yield
     finally:
@@ -42,4 +42,9 @@ app.include_router(ecosystems.router)
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "finnhub_configured": bool(settings.FINNHUB_API_KEY)}
+    from .services.yf_service import rate_limit_status
+    return {
+        "status": "ok",
+        "finnhub_configured": bool(settings.FINNHUB_API_KEY),
+        "yfinance": rate_limit_status(),
+    }

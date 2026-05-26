@@ -1,11 +1,12 @@
-"""Cache warmup — pre-fetch every ecosystem's data so first page-load is instant.
+"""Cache warmup — pre-fetch ONLY the default ecosystem's data at startup.
 
-`warm_all_caches()` is the startup hook. It runs the cheap concurrent yfinance
-work first, then the slow throttled Finnhub work. Server is ready to serve
-requests immediately; warmup happens in the background.
+Earlier versions warmed all 13 ecosystems (~173 unique tickers) at startup, but
+Yahoo's anti-bot tripped on that volume and IP-blocked the machine for 15-60min.
+Now we warm only the default ecosystem so first page-load is instant for the
+most common case; other ecosystems lazy-load on first visit.
 
-`warm_ecosystem_sync()` is for the on-demand refresh button — same shape but
-scoped to one ecosystem.
+`warm_ecosystem_sync()` is used by the refresh button and is rate-limit aware
+(the throttle is in yf_service / finnhub_service themselves).
 """
 import asyncio
 import logging
@@ -16,100 +17,73 @@ from . import finnhub_service, yf_service
 
 log = logging.getLogger(__name__)
 
-# yfinance concurrency — keep modest; the library is finicky under heavy parallelism.
-YF_CONCURRENCY = 8
+# Sequential with a small delay so we never blast Yahoo. ~30s for ~30 tickers.
+YF_CALL_DELAY_SEC = 0.4
 
 
-def _unique_symbols() -> set[str]:
-    out: set[str] = set()
-    for m in ecosystems.all_modules():
-        out.add(m.ANCHOR_TICKER)
-        out.update(ecosystems.all_tickers(m))
+def _ecosystem_symbols(eco_key: str) -> list[str]:
+    eco = ecosystems.get(eco_key)
+    seen: set[str] = set()
+    out: list[str] = []
+    for s in [eco.ANCHOR_TICKER, *ecosystems.all_tickers(eco)]:
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
     return out
 
 
-def _ecosystem_symbols(eco_key: str) -> set[str]:
-    eco = ecosystems.get(eco_key)
-    return {eco.ANCHOR_TICKER, *ecosystems.all_tickers(eco)}
+async def warm_default_ecosystem() -> None:
+    """At startup, warm only the default ecosystem. Other ecosystems lazy-load.
 
-
-async def warm_all_caches() -> None:
-    """Warm the cache for every ecosystem. Safe to run in background at startup."""
+    Why not warm everything: 173 unique tickers blasted at startup trips Yahoo's
+    anti-bot heuristics and IP-blocks the machine. One ecosystem's worth (~30
+    tickers) at 0.4s/call is gentle enough to be safe.
+    """
     start = time.monotonic()
-    symbols = _unique_symbols()
-    n_ecos = len(ecosystems.all_keys())
-    log.info(
-        "warmup: starting; %d unique tickers across %d ecosystems",
-        len(symbols), n_ecos,
-    )
+    eco_key = ecosystems.DEFAULT_KEY
+    symbols = _ecosystem_symbols(eco_key)
+    log.info("warmup: starting; %d tickers in default ecosystem (%s)", len(symbols), eco_key)
 
-    # 1. yfinance per-ticker quotes (concurrent, no rate limit).
-    sem = asyncio.Semaphore(YF_CONCURRENCY)
-
-    async def warm_quote(sym: str) -> None:
-        async with sem:
-            try:
-                await asyncio.to_thread(yf_service.get_quote, sym)
-            except Exception as e:
-                log.warning("warmup: get_quote(%s) failed: %s", sym, e)
-
-    await asyncio.gather(*(warm_quote(s) for s in symbols))
-    log.info("warmup: yfinance quotes done in %.1fs", time.monotonic() - start)
-
-    # 2. per-ecosystem grids (uses cached quotes — fast).
-    for m in ecosystems.all_modules():
-        try:
-            await asyncio.to_thread(yf_service.get_grid, m.KEY)
-        except Exception as e:
-            log.warning("warmup: get_grid(%s) failed: %s", m.KEY, e)
-
-    if not finnhub_service.has_key():
-        log.info("warmup: skipping Finnhub (no API key); complete in %.1fs",
-                 time.monotonic() - start)
-        return
-
-    # 3. earnings — one Finnhub call shared by every ecosystem's aggregate.
-    try:
-        await asyncio.to_thread(finnhub_service._fetch_earnings_calendar, 60)
-    except Exception as e:
-        log.warning("warmup: earnings calendar failed: %s", e)
-    for m in ecosystems.all_modules():
-        try:
-            await asyncio.to_thread(finnhub_service.get_earnings, m.KEY)
-        except Exception:
-            pass
-
-    # 4. per-ticker news (one Finnhub call per ticker; throttled inside finnhub_service).
-    log.info("warmup: starting Finnhub news (%d tickers, ~%.0fs at 1.2s each)",
-             len(symbols), len(symbols) * 1.2)
     for sym in symbols:
         try:
-            await asyncio.to_thread(finnhub_service._news_for_ticker, sym)
-        except Exception:
-            pass
+            await asyncio.to_thread(yf_service.get_quote, sym)
+        except Exception as e:
+            log.warning("warmup: get_quote(%s) failed: %s", sym, e)
+        await asyncio.sleep(YF_CALL_DELAY_SEC)
 
-    # 5. per-ecosystem news aggregates (uses cached per-ticker — fast).
-    for m in ecosystems.all_modules():
+    try:
+        await asyncio.to_thread(yf_service.get_grid, eco_key)
+    except Exception:
+        pass
+
+    if finnhub_service.has_key():
         try:
-            await asyncio.to_thread(finnhub_service.get_news, m.KEY)
+            await asyncio.to_thread(finnhub_service._fetch_earnings_calendar, 60)
         except Exception:
             pass
+        try:
+            await asyncio.to_thread(finnhub_service.get_earnings, eco_key)
+        except Exception:
+            pass
+        # News: throttle is in finnhub_service, but skip individual ticker news
+        # at startup to keep warmup quick. /api/news lazy-fills on first visit.
 
-    log.info("warmup: complete in %.1fs", time.monotonic() - start)
+    log.info("warmup: %s complete in %.1fs", eco_key, time.monotonic() - start)
 
 
 def warm_ecosystem_sync(eco_key: str) -> None:
     """Warm one ecosystem's caches synchronously. Used by the refresh endpoint
     via BackgroundTasks so the response returns immediately."""
     start = time.monotonic()
-    symbols = list(_ecosystem_symbols(eco_key))
+    symbols = _ecosystem_symbols(eco_key)
 
-    # yfinance — sequential is fine, ~15-20 tickers takes ~5s
     for s in symbols:
         try:
             yf_service.get_quote(s)
         except Exception as e:
             log.warning("refresh(%s): get_quote(%s) failed: %s", eco_key, s, e)
+        time.sleep(YF_CALL_DELAY_SEC)
     try:
         yf_service.get_grid(eco_key)
     except Exception:
@@ -120,7 +94,6 @@ def warm_ecosystem_sync(eco_key: str) -> None:
                  eco_key, time.monotonic() - start)
         return
 
-    # Finnhub — throttled at the service layer (~1.2s per call).
     try:
         finnhub_service._fetch_earnings_calendar(60)
     except Exception:

@@ -3,8 +3,16 @@
 Per-ticker functions (get_quote, get_detail, get_history) are ecosystem-agnostic
 and their caches are shared across ecosystems. Aggregate functions (get_grid)
 take an `eco_key` so their caches partition cleanly per ecosystem.
+
+When Yahoo rate-limits us (YFRateLimitError), we short-circuit all subsequent
+yfinance calls for RATE_LIMIT_BACKOFF_SEC instead of hammering Yahoo and making
+the block longer. The first call after the backoff window expires will try
+again and either succeed or restart the backoff.
 """
+import logging
 import math
+import threading
+import time
 from datetime import datetime
 from typing import Any, Optional
 
@@ -12,6 +20,34 @@ import yfinance as yf
 
 from .. import ecosystems
 from ..cache import cached
+
+log = logging.getLogger(__name__)
+
+# When Yahoo rate-limits us, back off for this long before trying again.
+RATE_LIMIT_BACKOFF_SEC = 15 * 60  # 15 minutes — Yahoo blocks typically clear in 15-60 min
+
+_rate_limit_lock = threading.Lock()
+_rate_limited_until: float = 0.0
+
+
+def _is_rate_limited() -> bool:
+    return time.monotonic() < _rate_limited_until
+
+
+def _mark_rate_limited() -> None:
+    global _rate_limited_until
+    with _rate_limit_lock:
+        _rate_limited_until = time.monotonic() + RATE_LIMIT_BACKOFF_SEC
+    log.warning(
+        "yfinance: Yahoo rate-limited; backing off all yf calls for %ds",
+        RATE_LIMIT_BACKOFF_SEC,
+    )
+
+
+def rate_limit_status() -> dict:
+    """For diagnostics — exposed via the API so the user knows what's happening."""
+    remaining = max(0, _rate_limited_until - time.monotonic())
+    return {"rate_limited": remaining > 0, "seconds_until_retry": int(remaining)}
 
 PERIOD_MAP: dict[str, tuple[str, str]] = {
     "1D": ("1d",  "5m"),
@@ -59,16 +95,40 @@ def _period_pct(ticker: yf.Ticker, period: str) -> Optional[float]:
         return None
 
 
-@cached("quote", ttl=300)
+def _is_valid_quote(q: dict) -> bool:
+    # Don't cache failures — yfinance hiccups under concurrent load and we'd
+    # rather retry on next request than serve None-price stubs for 5 minutes.
+    return q.get("price") is not None
+
+
+def _empty_quote(symbol: str) -> dict:
+    return {
+        "symbol": symbol, "name": symbol,
+        "price": None, "change_pct": None, "market_cap": None,
+        "pe_ratio": None, "ytd_pct": None, "one_year_pct": None,
+    }
+
+
+@cached("quote", ttl=300, should_cache=_is_valid_quote)
 def get_quote(symbol: str) -> dict:
+    if _is_rate_limited():
+        return _empty_quote(symbol)
     t = yf.Ticker(symbol)
     try:
         fast = dict(t.fast_info) if t.fast_info else {}
-    except Exception:
+    except Exception as e:
+        if "RateLimit" in type(e).__name__:
+            _mark_rate_limited()
+        else:
+            log.warning("get_quote(%s) fast_info failed: %s: %s", symbol, type(e).__name__, e)
         fast = {}
     try:
         info = t.info or {}
-    except Exception:
+    except Exception as e:
+        if "RateLimit" in type(e).__name__:
+            _mark_rate_limited()
+        else:
+            log.warning("get_quote(%s) info failed: %s: %s", symbol, type(e).__name__, e)
         info = {}
 
     price = (
